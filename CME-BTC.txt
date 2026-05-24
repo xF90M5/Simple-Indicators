@@ -1,0 +1,76 @@
+// © F90M5 Engine | CME Close Level
+//@version=5
+indicator("CME Close Level", overlay=true, max_lines_count=10, max_labels_count=10)
+
+// ─── APPEARANCE ───────────────────────────────────────────────────────────────
+grpApp     = "Appearance"
+lineColor  = input.color(#7b68ee,      "Line Color",  group=grpApp)
+lineWidth  = input.int(2,              "Line Width",  group=grpApp, minval=1, maxval=4)
+lineStyle  = input.string("Solid",     "Line Style",  group=grpApp, options=["Solid","Dashed","Dotted"])
+
+// ─── LABEL ────────────────────────────────────────────────────────────────────
+grpLbl     = "Label"
+labelText  = input.string("CME",       "Label Text",      group=grpLbl)
+labelColor = input.color(#7b68ee,      "Label Color",     group=grpLbl)
+labelSize  = input.string("Normal",    "Label Size",      group=grpLbl, options=["Auto","Tiny","Small","Normal","Large","Huge"])
+showLabel  = input.bool(true,          "Show Label",      group=grpLbl)
+
+// ─── POSITIONING ──────────────────────────────────────────────────────────────
+grpPos     = "Positioning"
+lineLen    = input.int(6,              "Line Length (bars left)",         group=grpPos, minval=1, maxval=200)
+labelOff   = input.int(6,             "Label Offset (bars right of edge)", group=grpPos, minval=0, maxval=50)
+
+// ─── DATA SOURCE ──────────────────────────────────────────────────────────────
+grpSrc     = "Data Source"
+srcTicker  = input.string("MBT1!",    "Ticker (CME symbol)",  group=grpSrc)
+srcTF      = input.string("1",        "Timeframe",            group=grpSrc)
+
+// ─── HELPERS ──────────────────────────────────────────────────────────────────
+_style(s) =>
+    s == "Dashed" ? line.style_dashed : s == "Dotted" ? line.style_dotted : line.style_solid
+
+_size(s) =>
+    s == "Auto"   ? size.auto   :
+     s == "Tiny"   ? size.tiny   :
+     s == "Normal" ? size.normal :
+     s == "Large"  ? size.large  :
+     s == "Huge"   ? size.huge   :
+     size.small
+
+// ─── PULL SOURCE CLOSE ────────────────────────────────────────────────────────
+mbtClose = request.security(srcTicker, srcTF, close)
+
+// ─── DETECT FRIDAY 17:00 ET ──────────────────────────────────────────────────
+t_cme    = timestamp("America/New_York", year, month, dayofmonth, 17, 0)
+isFri    = dayofweek == dayofweek.friday
+barEnd   = time + timeframe.in_seconds() * 1000
+isCMEBar = isFri and time <= t_cme and barEnd > t_cme
+
+// ─── STATE ────────────────────────────────────────────────────────────────────
+var float cmePrice = na
+var line  cmeLine  = na
+var label cmeLbl   = na
+
+// ─── CAPTURE PRICE ON CME CLOSE ───────────────────────────────────────────────
+if isCMEBar
+    cmePrice := mbtClose
+
+// ─── DRAW ON LAST BAR — PINNED TO RIGHT EDGE ─────────────────────────────────
+if barstate.islast and not na(cmePrice)
+    if not na(cmeLine)
+        line.delete(cmeLine)
+    if not na(cmeLbl)
+        label.delete(cmeLbl)
+
+    labelX     = bar_index + labelOff
+    lineStartX = labelX - lineLen
+
+    cmeLine := line.new(lineStartX, cmePrice, labelX, cmePrice,
+         color=lineColor, width=lineWidth, style=_style(lineStyle))
+
+    if showLabel
+        cmeLbl := label.new(labelX, cmePrice, labelText,
+             color=color.new(color.white, 100),
+             textcolor=labelColor,
+             style=label.style_none,
+             size=_size(labelSize))
