@@ -1,0 +1,622 @@
+//@version=5
+indicator("F90M5 SESSIONS (CISD+SMT)", overlay=true, max_lines_count=500, max_boxes_count=500, max_labels_count=500)
+
+// ==================== SESSION TIMEZONE ====================
+// Session strings are read in the chosen timezone — independent of the chart's
+// exchange (CME=Central, Binance=UTC, etc.) — so boxes land at the same clock times
+// on ES / NQ / BTC alike. Named zones AUTO-HANDLE DST (no seasonal toggle needed).
+etTZ = input.string("America/New_York", "Session timezone", options=["America/New_York", "Europe/London", "Europe/Berlin", "Asia/Tokyo", "Asia/Shanghai", "Asia/Dubai", "Australia/Sydney", "America/Chicago", "America/Los_Angeles", "UTC"], tooltip="Timezone the session times are read in. Default = New York (ET), which auto-handles US daylight saving (EDT/EST) — nothing to flip seasonally. Switch this when sharing with traders in other regions so they can enter session times in their own clock.", group="⏰ SESSION TIMEZONE")
+
+// ==================== SESSION INPUTS (visuals — unchanged) ====================
+asia_enabled = input.bool(true, "ASIA", inline="asia")
+asia_color_input = input.color(#2962FF, "", inline="asia")
+asia_session = input.session("1800-0400", "", inline="asia")
+asia_session_alldays = asia_session + ":1234567"
+asia_extend = input.bool(true, "Extend : Max/Min", inline="asia_opt")
+asia_mid = input.bool(false, "| Mid", inline="asia_opt")
+asia_fill = input.bool(true, "Fill", inline="asia_opt")
+
+london_enabled = input.bool(true, "LONDON", inline="london")
+london_color_input = input.color(#FF8C00, "", inline="london")
+london_session = input.session("0400-0800", "", inline="london")
+london_session_alldays = london_session + ":1234567"
+london_extend = input.bool(true, "Extend : Max/Min", inline="london_opt")
+london_mid = input.bool(false, "| Mid", inline="london_opt")
+london_fill = input.bool(true, "Fill", inline="london_opt")
+
+ny_enabled = input.bool(true, "NEW YORK", inline="ny")
+ny_color_input = input.color(#4CAF50, "", inline="ny")
+ny_session = input.session("0900-1700", "", inline="ny")
+ny_session_alldays = ny_session + ":1234567"
+ny_extend = input.bool(true, "Extend : Max/Min", inline="ny_opt")
+ny_mid = input.bool(false, "| Mid", inline="ny_opt")
+ny_fill = input.bool(true, "Fill", inline="ny_opt")
+
+lookback = input.int(30, "Lookback Sessions", minval=1, maxval=50)
+dropSweptLines = input.bool(true, "Free aged swept-line budget (keep untapped older)", tooltip="Every session draws its dotted high/low until price TAPS it, then freezes a mark at the sweep (matches the original) — this always happens for recent sessions. TradingView hard-caps a script at 500 line objects, so to keep OLD untapped resting liquidity drawing far to the left: ON = once a session scrolls past the lookback window, its already-tapped stub is dropped (the swept mark/label stays) to free budget for older untapped lines. OFF = keep every aged swept stub too (purest match, but old untapped lines get culled sooner).")
+label_offset = input.int(10, "Label Offset (bars)", minval=1, maxval=50)
+sessionLineWidth = input.int(3, "Session high/low line width", minval=1, maxval=6, tooltip="Thickness of the solid session high/low horizontals.")
+sessionExtWidth  = input.int(2, "Session extension (dotted) width", minval=1, maxval=6, tooltip="Thickness of the dotted high/low extension lines.")
+session_label_x_offset = input.int(-5, "Session Label X Offset", minval=-50, maxval=50)
+session_label_y_offset = input.float(0, "Session Label Y Offset (price units below line; 0 = anchored on line, zoom-stable)", minval=-500, maxval=500, step=1)
+htf_liquidity_only = input.bool(true, "HTF: Liquidity Only (hide boxes above 1H)")
+is_htf = htf_liquidity_only and (timeframe.in_seconds() >= 3600)
+show_boxes = not is_htf
+
+// ==================== ENTRY (CHoCH / CISD) INPUTS ====================
+grpEntry = "━━━ 🟢 ENTRY ━━━"
+choch_enabled    = input.bool(true,  "Show entry lines & arrows", group=grpEntry)
+entrySwingLen    = input.int(1, "Entry Swing Length", minval=1, maxval=50, tooltip="Pivot length used for entry. Lower number = more aggressive entries.", group=grpEntry)
+entryMode        = input.string("CHOCH", "Entry Mode", options=["CHOCH", "IFVG"], tooltip="CHOCH breakout entries. (IFVG reserved — falls back to CHOCH for now.)", group=grpEntry)
+confirmationType = input.string("Candle Close", "Confirmation", options=["Candle Close", "Wicks"], group=grpEntry)
+showSwings       = input.bool(false, "Show Swings", group=grpEntry)
+bullEntryColor   = input.color(#4CAF50, "Bullish Entry Color", group=grpEntry)
+bearEntryColor   = input.color(#F44336, "Bearish Entry Color", group=grpEntry)
+chochLineWidth   = input.int(2, "Line Width", minval=1, maxval=5, group=grpEntry)
+filterBySweeps   = input.bool(true,  "Filter entry arrows/lines by session sweeps", group=grpEntry)
+useMinDist       = input.bool(false, "Require minimum distance to nearest session level", group=grpEntry)
+minDistTicks     = input.int(20, "Min distance (ticks)", minval=0, group=grpEntry)
+dotGapAtr        = input.float(0.15, "Entry dot gap (× ATR)", minval=0, maxval=2, step=0.05, tooltip="Gap between the entry dot and the candle high/low, as a multiple of ATR(14). ATR-based so it scales across instruments (≈2 ticks on ES, a clean visible gap on BTC) and never prints on the wick. Raise for more clearance, lower for tighter.", group=grpEntry)
+dotGap = dotGapAtr * nz(ta.atr(14), 0)
+useMonotonic     = input.bool(false, "Use monotonic entry filter", tooltip="When ON: new buys only if breakout level is LOWER than prior buy entry; new sells only if breakout level is HIGHER than prior sell entry. NOTE: ground-truth CSV analysis of the original showed the real filter is session-sweep arming + one-entry-per-sweep, NOT this ratchet — turning it on cut real entries and worsened the match, so it now defaults OFF.", group=grpEntry)
+monoResetMode    = input.string("On new sweep", "Monotonic reset", options=["On opposite signal", "On new sweep", "Never"], tooltip="On new sweep (default, matches original) = each fresh session sweep resets that direction's ratchet, so the FIRST CHoCH after a sweep fires immediately (early) instead of being blocked by a stale level from a prior session. On opposite signal = ratchet resets only when the opposite direction fires (fires later). Never = persistent global ratchet (WARNING: starves over time).", group=grpEntry)
+maxPerSweep      = input.int(1, "Max entries per sweep", minval=1, maxval=10, tooltip="How many CISD entries one liquidity sweep can fire before the arm is spent. Cross-validated against the original on BTC/ES/NQ (92 entries): 1 (one entry per sweep) is count-correct and direction-perfect. Raise to 2 only if a session visibly under-fires vs the original.", group=grpEntry)
+entryDotSize     = input.string("large", "Entry dot size", options=["small","normal","large","huge"], tooltip="Match the original's larger filled dots.", group=grpEntry)
+dotSz = entryDotSize == "small" ? size.small : entryDotSize == "normal" ? size.normal : entryDotSize == "huge" ? size.huge : size.large
+
+// ==================== ENTRY TIME FILTERS ====================
+// Each window is evaluated in its OWN local timezone (NY / London / Tokyo), so
+// the union covers the live trading day INCLUDING the evening Asia hours — this
+// is why the original prints entries overnight that a single-TZ filter would drop.
+grpTF = "━━━ ⏰ ENTRY TIME FILTERS ━━━"
+useNY    = input.bool(true, "Use time filter (NY)", group=grpTF)
+nyTZ     = input.string("America/New_York", "NY timezone", group=grpTF)
+nySess   = input.session("0800-1400", "NY (HH:MM-HH:MM)", group=grpTF)
+useLDN   = input.bool(true, "Use time filter (LDN)", group=grpTF)
+ldnTZ    = input.string("Europe/London", "LDN timezone", group=grpTF)
+ldnSess  = input.session("0800-1300", "LDN (HH:MM-HH:MM)", group=grpTF)
+useASIA  = input.bool(true, "Use time filter (ASIA)", group=grpTF)
+asiaTZ   = input.string("Asia/Tokyo", "ASIA timezone", group=grpTF)
+asiaSess = input.session("0700-1700", "ASIA (HH:MM-HH:MM)", group=grpTF)
+
+// ==================== SMT (NQ <-> ES) ====================
+grpSMT = "━━━ 📈 SMT (NQ ↔ ES) ━━━"
+smtShow   = input.bool(true,  "Show SMT trend line", tooltip="Visual only — never used for entries.", group=grpSMT)
+smtAuto   = input.bool(true,  "Auto-detect SMT pair (default ES)", tooltip="Indices: on NQ/MNQ → compares ES; on ES/MES → compares NQ; anything else defaults to ES. Crypto: on BTC → compares ETH; on ETH → compares BTC (same exchange & quote, e.g. BINANCE:BTCUSDT ↔ BINANCE:ETHUSDT).", group=grpSMT)
+smtManual = input.symbol("CME_MINI:ES1!", "Manual comparison symbol", group=grpSMT)
+smtPivLen = input.int(5, "SMT pivot length", minval=1, maxval=50, tooltip="Higher = fewer, longer/cleaner divergence lines (connects bigger swings). Lower = more, shorter lines.", group=grpSMT)
+smtSweepGate = input.bool(true, "Only show SMT at session sweeps", tooltip="ON (matches original): a red (bearish) divergence only draws while the most recent sweep was a HIGH; a green (bullish) one only while the most recent sweep was a LOW. Anchors SMT to liquidity sweeps and kills mid-range noise. OFF = raw pivot divergence everywhere (noisy).", group=grpSMT)
+smtBullCol= input.color(#00E676, "SMT Bullish (lows)", group=grpSMT)
+smtBearCol= input.color(#FF5252, "SMT Bearish (highs)", group=grpSMT)
+smtWidth  = input.int(2, "SMT line width", minval=1, maxval=5, group=grpSMT)
+
+// ==================== RISK / REWARD (SL/TP) ====================
+grpSLTP = "━━━ 🎯 SL / TP PLOTTER ━━━"
+showSLTP            = input.bool(false, "Show SL/TP", group=grpSLTP)
+slPivotLen          = input.int(1, "SL pivot length", minval=1, group=grpSLTP)
+rewardMultiple      = input.float(1.8, "Reward Multiple (RR)", minval=0.1, step=0.05, group=grpSLTP)
+plotterOpacity      = input.int(97, "Plotter Fill Opacity", minval=0, maxval=100, group=grpSLTP)
+plotterExtend       = input.int(20, "Plotter Extend (bars)", minval=1, maxval=100, group=grpSLTP)
+slFillColor         = input.color(#F44336, "SL Fill Color", group=grpSLTP)
+tpFillColor         = input.color(#FFEB3B, "TP Fill Color", group=grpSLTP)
+entryLineColor      = input.color(#FFEB3B, "Entry Line Color", group=grpSLTP)
+
+grpCalc = "━━━ 💰 RISK CALCULATOR ━━━"
+showCalc            = input.bool(false, "Show Risk Calculator", group=grpCalc)
+dollarRisk          = input.float(100.0, "Dollar Risk ($)", minval=1.0, step=10.0, group=grpCalc)
+manualTickVal       = input.float(0.0, "Manual $/Tick (0=auto)", minval=0.0, step=0.25, group=grpCalc)
+manualTickSize      = input.float(0.0, "Manual Tick Size (0=auto)", minval=0.0, step=0.01, group=grpCalc)
+
+// ==================== FUTURES ====================
+f_getTickValue() =>
+    float tv = 0.0
+    float ts = 0.0
+    root = syminfo.root
+    sym = syminfo.ticker
+    if root == "MNQ" or str.contains(sym, "MNQ")
+        tv := 0.50, ts := 0.25
+    else if root == "NQ" or (str.contains(sym, "NQ") and not str.contains(sym, "MNQ"))
+        tv := 5.00, ts := 0.25
+    else if root == "MES" or str.contains(sym, "MES")
+        tv := 1.25, ts := 0.25
+    else if root == "ES" or (str.contains(sym, "ES") and not str.contains(sym, "MES"))
+        tv := 12.50, ts := 0.25
+    else if root == "MGC" or str.contains(sym, "MGC")
+        tv := 1.00, ts := 0.10
+    else if root == "GC" or (str.contains(sym, "GC") and not str.contains(sym, "MGC"))
+        tv := 10.00, ts := 0.10
+    else if root == "MBT" or str.contains(sym, "MBT")
+        tv := 1.25, ts := 5.0
+    else if str.contains(sym, "BTCUSDT") or str.contains(sym, "BTCUSD")
+        tv := 1.0, ts := 0.01
+    else
+        tv := syminfo.mintick * syminfo.pointvalue, ts := syminfo.mintick
+    [tv, ts]
+
+[autoTickVal, autoTickSize] = f_getTickValue()
+tickVal  = manualTickVal  > 0 ? manualTickVal  : autoTickVal
+tickSize = manualTickSize > 0 ? manualTickSize : autoTickSize
+
+// ==================== SESSION TRACKER ====================
+type SessionTracker
+    string name
+    color col
+    float session_high
+    float session_low
+    int start_bar
+    int end_bar
+    int session_day
+    int session_month
+    int session_year
+    bool is_active
+    bool high_swept
+    bool low_swept
+    int high_swept_bar
+    int low_swept_bar
+    line high_line
+    line low_line
+    box high_extend
+    box low_extend
+    box fill_box
+    label high_label
+    label low_label
+    label bottom_label
+    label high_swept_label
+    label low_swept_label
+    line mid_line
+    box mid_extend
+
+var array<SessionTracker> asia_sessions = array.new<SessionTracker>()
+var array<SessionTracker> london_sessions = array.new<SessionTracker>()
+var array<SessionTracker> ny_sessions = array.new<SessionTracker>()
+
+deleteSessionVisuals(SessionTracker old) =>
+    line.delete(old.high_line)
+    line.delete(old.low_line)
+    box.delete(old.high_extend)
+    box.delete(old.low_extend)
+    box.delete(old.fill_box)
+    label.delete(old.high_label)
+    label.delete(old.low_label)
+    label.delete(old.bottom_label)
+    label.delete(old.high_swept_label)
+    label.delete(old.low_swept_label)
+    line.delete(old.mid_line)
+    box.delete(old.mid_extend)
+
+deleteSessionBoxVisuals(SessionTracker old) =>
+    if not na(old.high_line)
+        line.delete(old.high_line)
+        old.high_line := na
+    if not na(old.low_line)
+        line.delete(old.low_line)
+        old.low_line := na
+    if not na(old.fill_box)
+        box.delete(old.fill_box)
+        old.fill_box := na
+    if not na(old.bottom_label)
+        label.delete(old.bottom_label)
+        old.bottom_label := na
+    if not na(old.mid_line)
+        line.delete(old.mid_line)
+        old.mid_line := na
+    // Aged-out sessions: drop ALREADY-SWEPT (tapped) stub lines to free TradingView's
+    // 500-line budget for older UNTAPPED resting liquidity. The swept LABEL (mark) stays.
+    // Recent sessions still freeze their stubs on tap (done in the live loop), so this
+    // only affects sessions that have scrolled past the lookback window.
+    if dropSweptLines and old.high_swept and not na(old.high_extend)
+        box.delete(old.high_extend)
+        old.high_extend := na
+    if dropSweptLines and old.low_swept and not na(old.low_extend)
+        box.delete(old.low_extend)
+        old.low_extend := na
+
+manageSession(sessions, name, sess_input, col, enabled, extend, fill, show_mid, offset, lbl_x_offset, lbl_y_offset) =>
+    if enabled
+        in_sess = not na(time(timeframe.period, sess_input, etTZ))
+        started = in_sess and not in_sess[1]
+        ended = not in_sess and in_sess[1]
+        SessionTracker current = na
+        if array.size(sessions) > 0
+            last = array.get(sessions, array.size(sessions) - 1)
+            if last.is_active
+                current := last
+        if started
+            new_sess = SessionTracker.new(name, col, high, low, bar_index, na, dayofmonth, month, year, true, false, false, na, na, na, na, na, na, na, na, na, na, na, na, na, na)
+            if show_boxes
+                new_sess.high_line := line.new(bar_index, high, bar_index, high, color=col, width=sessionLineWidth, style=line.style_solid)
+                new_sess.low_line := line.new(bar_index, low, bar_index, low, color=col, width=sessionLineWidth, style=line.style_solid)
+                if show_mid
+                    new_sess.mid_line := line.new(bar_index, (high+low)/2, bar_index, (high+low)/2, color=col, width=1, style=line.style_dashed)
+                if fill
+                    new_sess.fill_box := box.new(bar_index, high, bar_index, low, border_color=na, bgcolor=color.new(col, 92))
+                date_str = str.format("{0} {1}/{2}/{3}", name, str.tostring(dayofmonth, "00"), str.tostring(month, "00"), str.tostring(year))
+                new_sess.bottom_label := label.new(bar_index + lbl_x_offset, low - lbl_y_offset, date_str, style=label.style_label_upper_left, textcolor=col, color=color.new(color.white, 100), size=size.normal, textalign=text.align_left)
+            array.push(sessions, new_sess)
+            current := new_sess
+            if array.size(sessions) > lookback
+                cleanup_count = array.size(sessions) - lookback
+                removed = 0
+                idx = 0
+                while idx < cleanup_count - removed
+                    s = array.get(sessions, idx)
+                    if not s.is_active and s.high_swept and s.low_swept
+                        deleteSessionVisuals(s)
+                        array.remove(sessions, idx)
+                        removed += 1
+                    else if not s.is_active
+                        deleteSessionBoxVisuals(s)
+                        idx += 1
+                    else
+                        idx += 1
+        if not na(current)
+            if in_sess and current.is_active
+                if high > current.session_high
+                    current.session_high := high
+                if low < current.session_low
+                    current.session_low := low
+                if not na(current.high_line)
+                    line.set_xy1(current.high_line, current.start_bar, current.session_high)
+                    line.set_xy2(current.high_line, bar_index, current.session_high)
+                if not na(current.low_line)
+                    line.set_xy1(current.low_line, current.start_bar, current.session_low)
+                    line.set_xy2(current.low_line, bar_index, current.session_low)
+                if show_mid and not na(current.mid_line)
+                    mid_price = (current.session_high + current.session_low) / 2
+                    line.set_xy1(current.mid_line, current.start_bar, mid_price)
+                    line.set_xy2(current.mid_line, bar_index, mid_price)
+                if fill and not na(current.fill_box)
+                    box.set_right(current.fill_box, bar_index)
+                    box.set_top(current.fill_box, current.session_high)
+                    box.set_bottom(current.fill_box, current.session_low)
+                if not na(current.bottom_label)
+                    label.set_xy(current.bottom_label, current.start_bar + lbl_x_offset, current.session_low - lbl_y_offset)
+        if not na(current)
+            if ended and current.is_active
+                current.is_active := false
+                current.end_bar := bar_index[1]
+                date_str = str.format("{0} {1}/{2}/{3}", name, str.tostring(current.session_day, "00"), str.tostring(current.session_month, "00"), str.tostring(current.session_year))
+                if extend
+                    current.high_extend := box.new(current.end_bar, current.session_high, bar_index + offset, current.session_high, border_color=col, border_width=sessionExtWidth, border_style=line.style_dotted, bgcolor=na)
+                    current.high_label := label.new(bar_index + offset, current.session_high, date_str, style=label.style_label_left, textcolor=col, color=color.new(color.white, 100), size=size.tiny, textalign=text.align_left)
+                    current.low_extend := box.new(current.end_bar, current.session_low, bar_index + offset, current.session_low, border_color=col, border_width=sessionExtWidth, border_style=line.style_dotted, bgcolor=na)
+                    current.low_label := label.new(bar_index + offset, current.session_low, date_str, style=label.style_label_left, textcolor=col, color=color.new(color.white, 100), size=size.tiny, textalign=text.align_left)
+                    if show_mid
+                        current.mid_extend := box.new(current.end_bar, (current.session_high+current.session_low)/2, bar_index + offset, (current.session_high+current.session_low)/2, border_color=col, border_width=sessionExtWidth, border_style=line.style_dotted, bgcolor=na)
+        if array.size(sessions) > 0
+            for i = 0 to array.size(sessions) - 1
+                sess = array.get(sessions, i)
+                if not sess.is_active
+                    date_str = str.format("{0} {1}/{2}/{3}", name, str.tostring(sess.session_day, "00"), str.tostring(sess.session_month, "00"), str.tostring(sess.session_year))
+                    if not sess.high_swept and high > sess.session_high
+                        sess.high_swept := true
+                        sess.high_swept_bar := bar_index
+                        if not na(sess.high_extend)
+                            box.set_right(sess.high_extend, bar_index)
+                        if not na(sess.high_label)
+                            label.delete(sess.high_label)
+                            sess.high_label := na
+                        sess.high_swept_label := label.new(bar_index, sess.session_high, date_str, style=label.style_label_left, textcolor=col, color=color.new(color.white, 100), size=size.tiny, textalign=text.align_left)
+                    if not sess.low_swept and low < sess.session_low
+                        sess.low_swept := true
+                        sess.low_swept_bar := bar_index
+                        if not na(sess.low_extend)
+                            box.set_right(sess.low_extend, bar_index)
+                        if not na(sess.low_label)
+                            label.delete(sess.low_label)
+                            sess.low_label := na
+                        sess.low_swept_label := label.new(bar_index, sess.session_low, date_str, style=label.style_label_left, textcolor=col, color=color.new(color.white, 100), size=size.tiny, textalign=text.align_left)
+                    if not sess.high_swept and not na(sess.high_extend)
+                        box.set_right(sess.high_extend, bar_index + offset)
+                        if not na(sess.high_label)
+                            label.set_x(sess.high_label, bar_index + offset)
+                    if not sess.low_swept and not na(sess.low_extend)
+                        box.set_right(sess.low_extend, bar_index + offset)
+                        if not na(sess.low_label)
+                            label.set_x(sess.low_label, bar_index + offset)
+                    if show_mid and not na(sess.mid_extend)
+                        box.set_right(sess.mid_extend, bar_index + offset)
+
+manageSession(asia_sessions, "ASIA", asia_session_alldays, asia_color_input, asia_enabled, asia_extend, asia_fill, asia_mid, label_offset, session_label_x_offset, session_label_y_offset)
+manageSession(london_sessions, "LONDON", london_session_alldays, london_color_input, london_enabled, london_extend, london_fill, london_mid, label_offset, session_label_x_offset, session_label_y_offset)
+manageSession(ny_sessions, "NEW YORK", ny_session_alldays, ny_color_input, ny_enabled, ny_extend, ny_fill, ny_mid, label_offset, session_label_x_offset, session_label_y_offset)
+
+// ══════════════════════════════════════════════════════════════════
+// RESTING LIQUIDITY + SWEEP DETECTION   (ground-truth model, CSV-validated)
+// Each completed session's High & Low extends until a wick crosses it, then the
+// level is consumed. The cross IS the sweep: a swept low arms longs, a swept high
+// arms shorts. Validated direction-perfect against the original on BTC/ES/NQ.
+// ══════════════════════════════════════════════════════════════════
+var float asiaHi=na, var float asiaLo=na
+var float londonHi=na, var float londonLo=na
+var float nyHi=na, var float nyLo=na
+
+in_asia   = not na(time(timeframe.period, asia_session_alldays, etTZ))
+in_london = not na(time(timeframe.period, london_session_alldays, etTZ))
+in_ny     = not na(time(timeframe.period, ny_session_alldays, etTZ))
+
+// running session extremes (reset at each session open; also feed the min-distance filter)
+if in_asia and not in_asia[1]
+    asiaHi := high
+    asiaLo := low
+if in_asia
+    asiaHi := math.max(nz(asiaHi, high), high)
+    asiaLo := math.min(nz(asiaLo, low), low)
+if in_london and not in_london[1]
+    londonHi := high
+    londonLo := low
+if in_london
+    londonHi := math.max(nz(londonHi, high), high)
+    londonLo := math.min(nz(londonLo, low), low)
+if in_ny and not in_ny[1]
+    nyHi := high
+    nyLo := low
+if in_ny
+    nyHi := math.max(nz(nyHi, high), high)
+    nyLo := math.min(nz(nyLo, low), low)
+
+// Resting-liquidity pools: push each session's H/L the bar it COMPLETES; the level
+// stays live (extends right) until a wick crosses it, then it is consumed (swept once).
+var array<float> restHi = array.new<float>()
+var array<float> restLo = array.new<float>()
+if not in_asia and in_asia[1] and not na(asiaHi)
+    array.push(restHi, asiaHi)
+    array.push(restLo, asiaLo)
+if not in_london and in_london[1] and not na(londonHi)
+    array.push(restHi, londonHi)
+    array.push(restLo, londonLo)
+if not in_ny and in_ny[1] and not na(nyHi)
+    array.push(restHi, nyHi)
+    array.push(restLo, nyLo)
+while array.size(restHi) > 60
+    array.shift(restHi)
+while array.size(restLo) > 60
+    array.shift(restLo)
+
+bool newBuyside  = false
+bool newSellside = false
+// Buyside sweep = a wick trades UP through any resting session high → consume it.
+int _bi = 0
+while _bi < array.size(restHi)
+    if high > array.get(restHi, _bi)
+        newBuyside := true
+        array.remove(restHi, _bi)
+    else
+        _bi += 1
+// Sellside sweep = a wick trades DOWN through any resting session low → consume it.
+int _si = 0
+while _si < array.size(restLo)
+    if low < array.get(restLo, _si)
+        newSellside := true
+        array.remove(restLo, _si)
+    else
+        _si += 1
+
+// Directional arming follows the MOST RECENT sweep and is EXCLUSIVE: sweeping
+// buy-side liquidity (a completed session HIGH) arms shorts and disarms longs;
+// sweeping sell-side liquidity (a completed session LOW) arms longs and disarms
+// shorts. Only one side is live at a time — this is the primary noise filter and
+// is what was missing before (both sides used to latch true forever).
+var bool armShort = false
+var bool armLong  = false
+var int  armEntryCount = 0
+if newBuyside
+    armShort := true
+    armLong := false
+    armEntryCount := 0
+if newSellside
+    armLong := true
+    armShort := false
+    armEntryCount := 0
+
+// SMT sweep-regime flags — mirror the exclusive sweep state but are NEVER consumed
+// by entries (unlike armShort/armLong). Used to anchor SMT lines to liquidity sweeps:
+// a swept HIGH opens the bearish-SMT (red) window; a swept LOW opens bullish-SMT (green).
+var bool smtBearArmed = false
+var bool smtBullArmed = false
+if newBuyside
+    smtBearArmed := true
+    smtBullArmed := false
+if newSellside
+    smtBullArmed := true
+    smtBearArmed := false
+
+// ══════════════════════════════════════════════════════════════════
+// ENTRY TIME WINDOW
+// ══════════════════════════════════════════════════════════════════
+inNYw   = not na(time(timeframe.period, nySess   + ":1234567", nyTZ))
+inLDNw  = not na(time(timeframe.period, ldnSess  + ":1234567", ldnTZ))
+inASIAw = not na(time(timeframe.period, asiaSess + ":1234567", asiaTZ))
+anyTF = useNY or useLDN or useASIA
+inEntryWindow = (not anyTF) or (useNY and inNYw) or (useLDN and inLDNw) or (useASIA and inASIAw)
+
+// ══════════════════════════════════════════════════════════════════
+// CHoCH / CISD ENTRY ENGINE
+// ══════════════════════════════════════════════════════════════════
+len = entrySwingLen
+
+isSL = true
+isSH = true
+for i = 0 to len - 1
+    if low[len] >= low[i] or low[len] >= low[len + 1 + i]
+        isSL := false
+    if high[len] <= high[i] or high[len] <= high[len + 1 + i]
+        isSH := false
+
+var float swL = na, var int swLBar = na
+var float swH = na, var int swHBar = na
+
+// ─── BREAK DETECTION (against current confirmed swing) ───
+bool bearBreak = false
+bool bullBreak = false
+if choch_enabled and not na(swL)
+    bearBreak := confirmationType == "Candle Close" ? close < swL : low < swL
+if choch_enabled and not na(swH)
+    bullBreak := confirmationType == "Candle Close" ? close > swH : high > swH
+
+// ─── DIRECTIONAL GATE FROM SWEEPS ───
+bool bearOk = filterBySweeps ? armShort : true
+bool bullOk = filterBySweeps ? armLong  : true
+
+// ─── MONOTONIC RATCHET ───
+// Sells: each new short must break a HIGHER swing low than the prior short.
+// Buys:  each new long  must break a LOWER  swing high than the prior long.
+var float lastSellLvl = na
+var float lastBuyLvl  = na
+if monoResetMode == "On new sweep"
+    if newBuyside
+        lastSellLvl := na
+    if newSellside
+        lastBuyLvl := na
+bool bearMono = true
+bool bullMono = true
+if useMonotonic and bearBreak and not na(lastSellLvl)
+    bearMono := swL > lastSellLvl
+if useMonotonic and bullBreak and not na(lastBuyLvl)
+    bullMono := swH < lastBuyLvl
+
+// ─── OPTIONAL: MIN DISTANCE TO NEAREST SESSION LEVEL ───
+float nBull = na
+float nBear = na
+if useMinDist and not na(swH)
+    for lv in array.from(asiaHi, asiaLo, londonHi, londonLo, nyHi, nyLo)
+        if not na(lv)
+            nBull := na(nBull) ? math.abs(swH - lv) : math.min(nBull, math.abs(swH - lv))
+if useMinDist and not na(swL)
+    for lv in array.from(asiaHi, asiaLo, londonHi, londonLo, nyHi, nyLo)
+        if not na(lv)
+            nBear := na(nBear) ? math.abs(swL - lv) : math.min(nBear, math.abs(swL - lv))
+bool distOkBull = (not useMinDist) or (not na(nBull) and nBull >= minDistTicks * tickSize)
+bool distOkBear = (not useMinDist) or (not na(nBear) and nBear >= minDistTicks * tickSize)
+
+// ─── DEDUP (fire once per swing level) ───
+var float firedBearLvl = na
+var float firedBullLvl = na
+bool bearSignal = bearBreak and bearOk and bearMono and inEntryWindow and distOkBear and (na(firedBearLvl) or swL != firedBearLvl)
+bool bullSignal = bullBreak and bullOk and bullMono and inEntryWindow and distOkBull and (na(firedBullLvl) or swH != firedBullLvl)
+
+// ─── PLOT ───
+if bearSignal
+    lastSellLvl  := swL
+    firedBearLvl := swL
+    armEntryCount += 1
+    if armEntryCount >= maxPerSweep
+        armShort := false
+    if monoResetMode == "On opposite signal"
+        lastBuyLvl := na
+    label.new(bar_index, high + dotGap, "●", style=label.style_none, textcolor=bearEntryColor, size=dotSz)
+    line.new(nz(swLBar, bar_index - 5), swL, bar_index, swL, color=bearEntryColor, width=chochLineWidth, style=line.style_solid)
+    if showSLTP
+        float ep = swL
+        float sl = not na(swH) ? math.max(swH, high) : high
+        float risk = math.abs(sl - ep)
+        float tp = ep - risk * rewardMultiple
+        int ext = bar_index + plotterExtend
+        if risk > 0
+            box.new(bar_index, sl, ext, ep, border_color=color.new(slFillColor, math.max(plotterOpacity-30,0)), bgcolor=color.new(slFillColor, plotterOpacity), border_width=1)
+            box.new(bar_index, ep, ext, tp, border_color=color.new(tpFillColor, math.max(plotterOpacity-30,0)), bgcolor=color.new(tpFillColor, plotterOpacity), border_width=1)
+            line.new(bar_index, ep, ext, ep, color=entryLineColor, width=1, style=line.style_solid)
+            if showCalc
+                float rpc = risk / tickSize * tickVal
+                float cts = rpc > 0 ? math.floor(dollarRisk / rpc) : 0
+                label.new(bar_index, sl, "SHORT "+str.tostring(cts,"#")+"cts E:"+str.tostring(ep,format.mintick)+" SL:"+str.tostring(sl,format.mintick)+" TP:"+str.tostring(tp,format.mintick), style=label.style_label_down, color=color.new(color.black,20), textcolor=color.white, size=size.tiny)
+
+if bullSignal
+    lastBuyLvl   := swH
+    firedBullLvl := swH
+    armEntryCount += 1
+    if armEntryCount >= maxPerSweep
+        armLong := false
+    if monoResetMode == "On opposite signal"
+        lastSellLvl := na
+    label.new(bar_index, low - dotGap, "●", style=label.style_none, textcolor=bullEntryColor, size=dotSz)
+    line.new(nz(swHBar, bar_index - 5), swH, bar_index, swH, color=bullEntryColor, width=chochLineWidth, style=line.style_solid)
+    if showSLTP
+        float ep = swH
+        float sl = not na(swL) ? math.min(swL, low) : low
+        float risk = math.abs(ep - sl)
+        float tp = ep + risk * rewardMultiple
+        int ext = bar_index + plotterExtend
+        if risk > 0
+            box.new(bar_index, ep, ext, sl, border_color=color.new(slFillColor, math.max(plotterOpacity-30,0)), bgcolor=color.new(slFillColor, plotterOpacity), border_width=1)
+            box.new(bar_index, tp, ext, ep, border_color=color.new(tpFillColor, math.max(plotterOpacity-30,0)), bgcolor=color.new(tpFillColor, plotterOpacity), border_width=1)
+            line.new(bar_index, ep, ext, ep, color=entryLineColor, width=1, style=line.style_solid)
+            if showCalc
+                float rpc = risk / tickSize * tickVal
+                float cts = rpc > 0 ? math.floor(dollarRisk / rpc) : 0
+                label.new(bar_index, tp, "LONG "+str.tostring(cts,"#")+"cts E:"+str.tostring(ep,format.mintick)+" SL:"+str.tostring(sl,format.mintick)+" TP:"+str.tostring(tp,format.mintick), style=label.style_label_up, color=color.new(color.black,20), textcolor=color.white, size=size.tiny)
+
+// ─── UPDATE SWINGS (after break checks) ───
+if isSL
+    swL    := low[len]
+    swLBar := bar_index - len
+    firedBearLvl := na
+if isSH
+    swH    := high[len]
+    swHBar := bar_index - len
+    firedBullLvl := na
+
+// ─── OPTIONAL SWING MARKERS ───
+if showSwings and isSH
+    label.new(bar_index - len, high[len], "", yloc=yloc.abovebar, style=label.style_circle, color=color.new(color.gray, 40), size=size.tiny)
+if showSwings and isSL
+    label.new(bar_index - len, low[len], "", yloc=yloc.belowbar, style=label.style_circle, color=color.new(color.gray, 40), size=size.tiny)
+
+// ══════════════════════════════════════════════════════════════════
+// SMT DIVERGENCE LINE  (NQ <-> ES)  — visual only, never gates entries
+// ══════════════════════════════════════════════════════════════════
+isNQchart = syminfo.root == "NQ" or syminfo.root == "MNQ"
+isESchart = syminfo.root == "ES" or syminfo.root == "MES"
+isBTCchart = syminfo.basecurrency == "BTC" or syminfo.basecurrency == "XBT"
+isETHchart = syminfo.basecurrency == "ETH"
+// Crypto pair: BTC <-> ETH on the SAME exchange & quote currency
+// (e.g. BINANCE:BTCUSDT <-> BINANCE:ETHUSDT). Built from the chart's own prefix/quote so it adapts.
+cryptoCmp = isBTCchart ? (syminfo.prefix + ":ETH" + syminfo.currency) : (syminfo.prefix + ":BTC" + syminfo.currency)
+// Resolution order: manual override → crypto BTC/ETH → indices (default ES, flip to NQ on ES/MES).
+smtSym = not smtAuto ? smtManual : (isBTCchart or isETHchart) ? cryptoCmp : (isESchart ? "CME_MINI:NQ1!" : "CME_MINI:ES1!")
+
+[cmpH, cmpL] = request.security(smtSym, timeframe.period, [high, low], ignore_invalid_symbol=true)
+
+ph = ta.pivothigh(high, smtPivLen, smtPivLen)
+pl = ta.pivotlow(low,  smtPivLen, smtPivLen)
+cmpHatPiv = cmpH[smtPivLen]
+cmpLatPiv = cmpL[smtPivLen]
+
+var float pPHp = na, var float pPHc = na, var int pPHb = na
+var float pPLp = na, var float pPLc = na, var int pPLb = na
+var array<line> smtLineArr = array.new<line>()
+
+// Highs → bearish divergence (red)
+if smtShow and not na(ph) and not na(cmpHatPiv)
+    pbar = bar_index - smtPivLen
+    if not na(pPHp) and not na(pPHc)
+        chartUp = ph - pPHp
+        cmpUp   = cmpHatPiv - pPHc
+        if (chartUp > 0) != (cmpUp > 0) and (not smtSweepGate or smtBearArmed)
+            ln = line.new(pPHb, pPHp, pbar, ph, color=smtBearCol, width=smtWidth)
+            array.push(smtLineArr, ln)
+            if array.size(smtLineArr) > 80
+                line.delete(array.shift(smtLineArr))
+    pPHp := ph
+    pPHc := cmpHatPiv
+    pPHb := pbar
+
+// Lows → bullish divergence (green)
+if smtShow and not na(pl) and not na(cmpLatPiv)
+    pbar = bar_index - smtPivLen
+    if not na(pPLp) and not na(pPLc)
+        chartDn = pl - pPLp
+        cmpDn   = cmpLatPiv - pPLc
+        if (chartDn < 0) != (cmpDn < 0) and (not smtSweepGate or smtBullArmed)
+            ln = line.new(pPLb, pPLp, pbar, pl, color=smtBullCol, width=smtWidth)
+            array.push(smtLineArr, ln)
+            if array.size(smtLineArr) > 80
+                line.delete(array.shift(smtLineArr))
+    pPLp := pl
+    pPLc := cmpLatPiv
+    pPLb := pbar
+
+// ─── ALERTS ───
+alertcondition(bearSignal, "Bearish CHoCH", "Bearish CHoCH SHORT")
+alertcondition(bullSignal, "Bullish CHoCH", "Bullish CHoCH LONG")
+alertcondition(bearSignal or bullSignal, "Any CHoCH", "CHoCH signal")
